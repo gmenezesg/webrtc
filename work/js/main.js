@@ -1,189 +1,345 @@
 'use strict';
 
-var localConnection;
-var remoteConnection;
-var sendChannel;
-var receiveChannel;
-var pcConstraint;
-var dataConstraint;
-var dataChannelSend = document.querySelector('textarea#dataChannelSend');
-var dataChannelReceive = document.querySelector('textarea#dataChannelReceive');
-var startButton = document.querySelector('button#startButton');
-var sendButton = document.querySelector('button#sendButton');
-var closeButton = document.querySelector('button#closeButton');
+var isChannelReady = false;
+var isInitiator = false;
+var isStarted = false;
+var localStream;
+var pc;
+var remoteStream;
+var turnReady;
 
-startButton.onclick = createConnection;
-sendButton.onclick = sendData;
-closeButton.onclick = closeDataChannels;
+var pcConfig = {
+  'iceServers': [{
+    'urls': 'stun:stun.l.google.com:19302'
+  }]
+};
 
-function enableStartButton() {
-  startButton.disabled = false;
+// Set up audio and video regardless of what devices are present.
+var sdpConstraints = {
+  offerToReceiveAudio: true,
+  offerToReceiveVideo: true
+};
+
+/////////////////////////////////////////////
+
+var room = 'foo';
+// Could prompt for room name:
+// room = prompt('Enter room name:');
+
+var socket = io.connect();
+
+if (room !== '') {
+  socket.emit('create or join', room);
+  console.log('Attempted to create or  join room', room);
 }
 
-function disableSendButton() {
-  sendButton.disabled = true;
+socket.on('created', function(room) {
+  console.log('Created room ' + room);
+  isInitiator = true;
+});
+
+socket.on('full', function(room) {
+  console.log('Room ' + room + ' is full');
+});
+
+socket.on('join', function (room){
+  console.log('Another peer made a request to join room ' + room);
+  console.log('This peer is the initiator of room ' + room + '!');
+  isChannelReady = true;
+});
+
+socket.on('joined', function(room) {
+  console.log('joined: ' + room);
+  isChannelReady = true;
+});
+
+socket.on('log', function(array) {
+  console.log.apply(console, array);
+});
+
+////////////////////////////////////////////////
+
+function sendMessage(message) {
+  console.log('Client sending message: ', message);
+  socket.emit('message', message);
 }
 
-function createConnection() {
-  dataChannelSend.placeholder = '';
-  var servers = null;
-  pcConstraint = null;
-  dataConstraint = null;
-  trace('Using SCTP based data channels');
-  // For SCTP, reliable and ordered delivery is true by default.
-  // Add localConnection to global scope to make it visible
-  // from the browser console.
-  window.localConnection = localConnection =
-      new RTCPeerConnection(servers, pcConstraint);
-  trace('Created local peer connection object localConnection');
+// This client receives a message
+socket.on('message', function(message) {
+  console.log('Client received message:', message);
+  if (message === 'got user media') {
+    maybeStart();
+  } else if (message.type === 'offer') {
+    if (!isInitiator && !isStarted) {
+      maybeStart();
+    }
+    pc.setRemoteDescription(new RTCSessionDescription(message));
+    doAnswer();
+  } else if (message.type === 'answer' && isStarted) {
+    pc.setRemoteDescription(new RTCSessionDescription(message));
+  } else if (message.type === 'candidate' && isStarted) {
+    var candidate = new RTCIceCandidate({
+      sdpMLineIndex: message.label,
+      candidate: message.candidate
+    });
+    pc.addIceCandidate(candidate);
+  } else if (message === 'bye' && isStarted) {
+    handleRemoteHangup();
+  }
+});
 
-  sendChannel = localConnection.createDataChannel('sendDataChannel',
-      dataConstraint);
-  trace('Created send data channel');
+////////////////////////////////////////////////////
 
-  localConnection.onicecandidate = iceCallback1;
-  sendChannel.onopen = onSendChannelStateChange;
-  sendChannel.onclose = onSendChannelStateChange;
+var localVideo = document.querySelector('#localVideo');
+var remoteVideo = document.querySelector('#remoteVideo');
 
-  // Add remoteConnection to global scope to make it visible
-  // from the browser console.
-  window.remoteConnection = remoteConnection =
-      new RTCPeerConnection(servers, pcConstraint);
-  trace('Created remote peer connection object remoteConnection');
+navigator.mediaDevices.getUserMedia({
+  audio: false,
+  video: true
+})
+.then(gotStream)
+.catch(function(e) {
+  alert('getUserMedia() error: ' + e.name);
+});
 
-  remoteConnection.onicecandidate = iceCallback2;
-  remoteConnection.ondatachannel = receiveChannelCallback;
+function gotStream(stream) {
+  console.log('Adding local stream.');
+  localVideo.src = window.URL.createObjectURL(stream);
+  localStream = stream;
+  sendMessage('got user media');
+  if (isInitiator) {
+    maybeStart();
+  }
+}
 
-  localConnection.createOffer().then(
-    gotDescription1,
+var constraints = {
+  video: true
+};
+
+console.log('Getting user media with constraints', constraints);
+
+if (location.hostname !== 'localhost') {
+  requestTurn(
+    'https://computeengineondemand.appspot.com/turn?username=41784574&key=4080218913'
+  );
+}
+
+function maybeStart() {
+  console.log('>>>>>>> maybeStart() ', isStarted, localStream, isChannelReady);
+  if (!isStarted && typeof localStream !== 'undefined' && isChannelReady) {
+    console.log('>>>>>> creating peer connection');
+    createPeerConnection();
+    pc.addStream(localStream);
+    isStarted = true;
+    console.log('isInitiator', isInitiator);
+    if (isInitiator) {
+      doCall();
+    }
+  }
+}
+
+window.onbeforeunload = function() {
+  sendMessage('bye');
+};
+
+/////////////////////////////////////////////////////////
+
+function createPeerConnection() {
+  try {
+    pc = new RTCPeerConnection(null);
+    pc.onicecandidate = handleIceCandidate;
+    pc.onaddstream = handleRemoteStreamAdded;
+    pc.onremovestream = handleRemoteStreamRemoved;
+    console.log('Created RTCPeerConnnection');
+  } catch (e) {
+    console.log('Failed to create PeerConnection, exception: ' + e.message);
+    alert('Cannot create RTCPeerConnection object.');
+    return;
+  }
+}
+
+function handleIceCandidate(event) {
+  console.log('icecandidate event: ', event);
+  if (event.candidate) {
+    sendMessage({
+      type: 'candidate',
+      label: event.candidate.sdpMLineIndex,
+      id: event.candidate.sdpMid,
+      candidate: event.candidate.candidate
+    });
+  } else {
+    console.log('End of candidates.');
+  }
+}
+
+function handleRemoteStreamAdded(event) {
+  console.log('Remote stream added.');
+  remoteVideo.src = window.URL.createObjectURL(event.stream);
+  remoteStream = event.stream;
+}
+
+function handleCreateOfferError(event) {
+  console.log('createOffer() error: ', event);
+}
+
+function doCall() {
+  console.log('Sending offer to peer');
+  pc.createOffer(setLocalAndSendMessage, handleCreateOfferError);
+}
+
+function doAnswer() {
+  console.log('Sending answer to peer.');
+  pc.createAnswer().then(
+    setLocalAndSendMessage,
     onCreateSessionDescriptionError
   );
-  startButton.disabled = true;
-  closeButton.disabled = false;
+}
+
+function setLocalAndSendMessage(sessionDescription) {
+  // Set Opus as the preferred codec in SDP if Opus is present.
+  //  sessionDescription.sdp = preferOpus(sessionDescription.sdp);
+  pc.setLocalDescription(sessionDescription);
+  console.log('setLocalAndSendMessage sending message', sessionDescription);
+  sendMessage(sessionDescription);
 }
 
 function onCreateSessionDescriptionError(error) {
   trace('Failed to create session description: ' + error.toString());
 }
 
-function sendData() {
-  var data = dataChannelSend.value;
-  sendChannel.send(data);
-  trace('Sent Data: ' + data);
-}
-
-function closeDataChannels() {
-  trace('Closing data channels');
-  sendChannel.close();
-  trace('Closed data channel with label: ' + sendChannel.label);
-  receiveChannel.close();
-  trace('Closed data channel with label: ' + receiveChannel.label);
-  localConnection.close();
-  remoteConnection.close();
-  localConnection = null;
-  remoteConnection = null;
-  trace('Closed peer connections');
-  startButton.disabled = false;
-  sendButton.disabled = true;
-  closeButton.disabled = true;
-  dataChannelSend.value = '';
-  dataChannelReceive.value = '';
-  dataChannelSend.disabled = true;
-  disableSendButton();
-  enableStartButton();
-}
-
-function gotDescription1(desc) {
-  localConnection.setLocalDescription(desc);
-  trace('Offer from localConnection \n' + desc.sdp);
-  remoteConnection.setRemoteDescription(desc);
-  remoteConnection.createAnswer().then(
-    gotDescription2,
-    onCreateSessionDescriptionError
-  );
-}
-
-function gotDescription2(desc) {
-  remoteConnection.setLocalDescription(desc);
-  trace('Answer from remoteConnection \n' + desc.sdp);
-  localConnection.setRemoteDescription(desc);
-}
-
-function iceCallback1(event) {
-  trace('local ice callback');
-  if (event.candidate) {
-    remoteConnection.addIceCandidate(
-      event.candidate
-    ).then(
-      onAddIceCandidateSuccess,
-      onAddIceCandidateError
-    );
-    trace('Local ICE candidate: \n' + event.candidate.candidate);
+function requestTurn(turnURL) {
+  var turnExists = false;
+  for (var i in pcConfig.iceServers) {
+    if (pcConfig.iceServers[i].url.substr(0, 5) === 'turn:') {
+      turnExists = true;
+      turnReady = true;
+      break;
+    }
+  }
+  if (!turnExists) {
+    console.log('Getting TURN server from ', turnURL);
+    // No TURN server. Get one from computeengineondemand.appspot.com:
+    var xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState === 4 && xhr.status === 200) {
+        var turnServer = JSON.parse(xhr.responseText);
+        console.log('Got TURN server: ', turnServer);
+        pcConfig.iceServers.push({
+          'url': 'turn:' + turnServer.username + '@' + turnServer.turn,
+          'credential': turnServer.password
+        });
+        turnReady = true;
+      }
+    };
+    xhr.open('GET', turnURL, true);
+    xhr.send();
   }
 }
 
-function iceCallback2(event) {
-  trace('remote ice callback');
-  if (event.candidate) {
-    localConnection.addIceCandidate(
-      event.candidate
-    ).then(
-      onAddIceCandidateSuccess,
-      onAddIceCandidateError
-    );
-    trace('Remote ICE candidate: \n ' + event.candidate.candidate);
+function handleRemoteStreamAdded(event) {
+  console.log('Remote stream added.');
+  remoteVideo.src = window.URL.createObjectURL(event.stream);
+  remoteStream = event.stream;
+}
+
+function handleRemoteStreamRemoved(event) {
+  console.log('Remote stream removed. Event: ', event);
+}
+
+function hangup() {
+  console.log('Hanging up.');
+  stop();
+  sendMessage('bye');
+}
+
+function handleRemoteHangup() {
+  console.log('Session terminated.');
+  stop();
+  isInitiator = false;
+}
+
+function stop() {
+  isStarted = false;
+  // isAudioMuted = false;
+  // isVideoMuted = false;
+  pc.close();
+  pc = null;
+}
+
+///////////////////////////////////////////
+
+// Set Opus as the default audio codec if it's present.
+function preferOpus(sdp) {
+  var sdpLines = sdp.split('\r\n');
+  var mLineIndex;
+  // Search for m line.
+  for (var i = 0; i < sdpLines.length; i++) {
+    if (sdpLines[i].search('m=audio') !== -1) {
+      mLineIndex = i;
+      break;
+    }
   }
-}
-
-function onAddIceCandidateSuccess() {
-  trace('AddIceCandidate success.');
-}
-
-function onAddIceCandidateError(error) {
-  trace('Failed to add Ice Candidate: ' + error.toString());
-}
-
-function receiveChannelCallback(event) {
-  trace('Receive Channel Callback');
-  receiveChannel = event.channel;
-  receiveChannel.onmessage = onReceiveMessageCallback;
-  receiveChannel.onopen = onReceiveChannelStateChange;
-  receiveChannel.onclose = onReceiveChannelStateChange;
-}
-
-function onReceiveMessageCallback(event) {
-  trace('Received Message');
-  dataChannelReceive.value = event.data;
-}
-
-function onSendChannelStateChange() {
-  var readyState = sendChannel.readyState;
-  trace('Send channel state is: ' + readyState);
-  if (readyState === 'open') {
-    dataChannelSend.disabled = false;
-    dataChannelSend.focus();
-    sendButton.disabled = false;
-    closeButton.disabled = false;
-  } else {
-    dataChannelSend.disabled = true;
-    sendButton.disabled = true;
-    closeButton.disabled = true;
+  if (mLineIndex === null) {
+    return sdp;
   }
+
+  // If Opus is available, set it as the default in m line.
+  for (i = 0; i < sdpLines.length; i++) {
+    if (sdpLines[i].search('opus/48000') !== -1) {
+      var opusPayload = extractSdp(sdpLines[i], /:(\d+) opus\/48000/i);
+      if (opusPayload) {
+        sdpLines[mLineIndex] = setDefaultCodec(sdpLines[mLineIndex],
+          opusPayload);
+      }
+      break;
+    }
+  }
+
+  // Remove CN in m line and sdp.
+  sdpLines = removeCN(sdpLines, mLineIndex);
+
+  sdp = sdpLines.join('\r\n');
+  return sdp;
 }
 
-function onReceiveChannelStateChange() {
-  var readyState = receiveChannel.readyState;
-  trace('Receive channel state is: ' + readyState);
+function extractSdp(sdpLine, pattern) {
+  var result = sdpLine.match(pattern);
+  return result && result.length === 2 ? result[1] : null;
 }
 
-function trace(text) {
-  if (text[text.length - 1] === '\n') {
-    text = text.substring(0, text.length - 1);
+// Set the selected codec to the first in m line.
+function setDefaultCodec(mLine, payload) {
+  var elements = mLine.split(' ');
+  var newLine = [];
+  var index = 0;
+  for (var i = 0; i < elements.length; i++) {
+    if (index === 3) { // Format of media starts from the fourth.
+      newLine[index++] = payload; // Put target payload to the first.
+    }
+    if (elements[i] !== payload) {
+      newLine[index++] = elements[i];
+    }
   }
-  if (window.performance) {
-    var now = (window.performance.now() / 1000).toFixed(3);
-    console.log(now + ': ' + text);
-  } else {
-    console.log(text);
+  return newLine.join(' ');
+}
+
+// Strip CN from sdp before CN constraints is ready.
+function removeCN(sdpLines, mLineIndex) {
+  var mLineElements = sdpLines[mLineIndex].split(' ');
+  // Scan from end for the convenience of removing an item.
+  for (var i = sdpLines.length - 1; i >= 0; i--) {
+    var payload = extractSdp(sdpLines[i], /a=rtpmap:(\d+) CN\/\d+/i);
+    if (payload) {
+      var cnPos = mLineElements.indexOf(payload);
+      if (cnPos !== -1) {
+        // Remove CN payload from m line.
+        mLineElements.splice(cnPos, 1);
+      }
+      // Remove CN line in sdp
+      sdpLines.splice(i, 1);
+    }
   }
+
+  sdpLines[mLineIndex] = mLineElements.join(' ');
+  return sdpLines;
 }
